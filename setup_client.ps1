@@ -46,7 +46,11 @@ $phys = Get-NetRoute -DestinationPrefix "0.0.0.0/0" -ErrorAction SilentlyContinu
 if (-not $phys) { throw "No hay ruta física por defecto." }
 $physGw = $phys.NextHop
 $physIdx = $phys.ifIndex
-route delete $ServerIP 2>$null | Out-Null
+# Idempotente: quita la ruta previa si existe. Con cmdlets, no con `route
+# delete`: el stderr de un exe nativo se vuelve error terminante por el
+# $ErrorActionPreference = "Stop" y abortaba el script en la 1ra corrida.
+Get-NetRoute -DestinationPrefix "$ServerIP/32" -ErrorAction SilentlyContinue |
+    Remove-NetRoute -Confirm:$false -ErrorAction SilentlyContinue
 New-NetRoute -DestinationPrefix "$ServerIP/32" -InterfaceIndex $physIdx -NextHop $physGw | Out-Null
 Write-Host "Ruta al servidor $ServerIP vía red física ($physGw)."
 
