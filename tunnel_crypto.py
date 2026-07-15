@@ -125,6 +125,10 @@ class Tunnel:
         Lanza InvalidTag si el datagrama fue alterado/no es auténtico, o
         ReplayError si el contador ya se había visto o es demasiado viejo.
         """
+        # Un datagrama más corto que [contador][tag] no puede ser auténtico:
+        # se rechaza como InvalidTag (mismo camino que un tag alterado).
+        if len(datagram) < COUNTER_SIZE + TAG_SIZE:
+            raise InvalidTag
         counter_bytes = datagram[:COUNTER_SIZE]
         counter = int.from_bytes(counter_bytes, "little")
         nonce = b"\x00\x00\x00\x00" + counter_bytes

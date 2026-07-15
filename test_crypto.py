@@ -57,6 +57,19 @@ def test_replay_rejected() -> None:
     raise AssertionError("el replay no fue detectado")
 
 
+def test_short_datagram_rejected() -> None:
+    # Basura corta al puerto UDP: debe salir por InvalidTag, no reventar con
+    # ValueError ("Nonce must be 12 bytes") y tumbar el servidor.
+    server = Tunnel("server")
+    for basura in (b"", b"abc", b"1234567"):
+        try:
+            server.open_(basura)
+        except InvalidTag:
+            continue
+        raise AssertionError(f"datagrama corto {basura!r} no dio InvalidTag")
+    print("OK datagrama corto rechazado como InvalidTag (no tumba el servidor)")
+
+
 def test_out_of_order_ok_but_old_rejected() -> None:
     client, server = Tunnel("client"), Tunnel("server")
     # Genera varios datagramas (contadores 0..WINDOW_SIZE+2).
@@ -78,6 +91,7 @@ if __name__ == "__main__":
     test_roundtrip()
     test_direction_keys_differ()
     test_tamper_rejected()
+    test_short_datagram_rejected()
     test_replay_rejected()
     test_out_of_order_ok_but_old_rejected()
     print("\nTodas las pruebas de cripto pasaron.")

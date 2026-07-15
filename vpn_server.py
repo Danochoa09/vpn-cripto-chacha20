@@ -44,7 +44,6 @@ def up_loop(sock: socket.socket, tun: TunAdapter, peer: Peer,
             tunnel: Tunnel) -> None:
     while True:
         datagram, addr = sock.recvfrom(65535)
-        peer.set(addr)
         try:
             packet = tunnel.open_(datagram)  # tag + descifrado + anti-replay
         except InvalidTag:
@@ -53,6 +52,9 @@ def up_loop(sock: socket.socket, tun: TunAdapter, peer: Peer,
         except ReplayError:
             print(f"[SERVIDOR] replay descartado de {addr[0]}")
             continue
+        # Solo tras autenticar aprendemos la dirección del cliente: si no,
+        # cualquier UDP ajeno al puerto redirigiría el tráfico de bajada.
+        peer.set(addr)
         # Un paquete IP válido mide >= 20 bytes (encabezado IPv4). Los
         # keepalive del cliente (1 byte) caen aquí y se ignoran.
         if len(packet) < 20:
