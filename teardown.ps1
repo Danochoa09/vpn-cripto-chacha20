@@ -46,6 +46,31 @@ if (Test-Path $stateFile) {
 } else {
     Write-Host "Sin registro '.ipv6_disabled': no se toca el IPv6 de ningún adaptador."
 }
+
+# Restaurar el DNS que setup_client.ps1 sobrescribió en los adaptadores físicos
+# (lo forzaba al DNS del túnel para que ninguna consulta saliera on-link sin
+# cifrar). El registro guarda la config ESTÁTICA previa; vacío significa que el
+# DNS venía por DHCP y hay que devolverlo a DHCP, no fijarlo.
+$dnsBackup = Join-Path $PSScriptRoot ".dns_backup"
+if (Test-Path $dnsBackup) {
+    foreach ($line in Get-Content $dnsBackup) {
+        if (-not $line.Trim()) { continue }
+        $parts = $line -split '\|', 2
+        $name = $parts[0]
+        # El NameServer del registro separa con coma o espacio segun la version.
+        $prev = if ($parts.Length -gt 1 -and $parts[1].Trim()) { $parts[1] -split '[,\s]+' | Where-Object { $_ } } else { $null }
+        if ($prev) {
+            Set-DnsClientServerAddress -InterfaceAlias $name -ServerAddresses $prev
+            Write-Host "DNS restaurado en '$name': $($prev -join ', ')"
+        } else {
+            Set-DnsClientServerAddress -InterfaceAlias $name -ResetServerAddresses
+            Write-Host "DNS de '$name' devuelto a DHCP."
+        }
+    }
+    Remove-Item $dnsBackup -Force
+} else {
+    Write-Host "Sin registro '.dns_backup': no se toca el DNS de ningún adaptador."
+}
 Clear-DnsClientCache
 
 # Las IPs y el adaptador desaparecen solos al cerrar Python (Wintun los

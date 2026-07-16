@@ -62,7 +62,38 @@ Write-Host "Tráfico de internet redirigido por el túnel (gateway $Gateway)."
 
 # DNS por el túnel (si no, las consultas DNS podrían filtrarse o fallar)
 Set-DnsClientServerAddress -InterfaceAlias $TunAlias -ServerAddresses $Dns
+Set-NetIPInterface -InterfaceAlias $TunAlias -InterfaceMetric 1 -ErrorAction SilentlyContinue
 Write-Host "DNS del túnel: $Dns"
+
+# Cerrar la fuga de DNS por IPv4. El hotspot entrega su propia IP como DNS por
+# DHCP (192.168.137.1), que esta en la MISMA subred que el cliente: la ruta
+# conectada /24 gana a las /1 del tunel, asi que esa consulta sale on-link, en
+# claro, con la VPN arriba. Verificado en Wireshark: Dst 192.168.137.1.
+#
+# No se pelea con el resolver de Windows (que consulta por varias interfaces a
+# la vez): se hace que TODO camino lleve al tunel. Con $Dns tambien en los
+# adaptadores fisicos, cualquier consulta va dirigida a $Dns -- y la ruta a $Dns
+# es la 0.0.0.0/1 por el tunel. El enrutamiento es global; el resolver no lo
+# esquiva. Si el tunel cae, $Dns sigue siendo alcanzable por la ruta fisica, asi
+# que no se rompe la resolucion.
+#
+# Se guarda el DNS previo de cada adaptador en .dns_backup para que teardown.ps1
+# restaure exactamente lo que habia (estatico o DHCP), no un estado impuesto.
+$dnsBackup = Join-Path $PSScriptRoot ".dns_backup"
+$lines = @()
+foreach ($a in Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -ne $TunAlias }) {
+    # Get-DnsClientServerAddress devuelve los servidores EFECTIVOS sin decir de
+    # donde salen. El valor NameServer del registro solo contiene los ESTATICOS:
+    # vacio => el DNS venia por DHCP. Sin esta distincion, teardown restauraria
+    # como estatico un DNS que era de DHCP, cambiando la config del equipo a sus
+    # espaldas.
+    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($a.InterfaceGuid)"
+    $static = (Get-ItemProperty -Path $key -Name NameServer -ErrorAction SilentlyContinue).NameServer
+    $lines += "$($a.Name)|$static"
+    Set-DnsClientServerAddress -InterfaceAlias $a.Name -ServerAddresses $Dns
+}
+$lines | Set-Content -Path $dnsBackup -Encoding utf8
+Write-Host "DNS $Dns forzado en los adaptadores físicos (cierra la fuga on-link)."
 
 # Cerrar la fuga IPv6. Las rutas de arriba son IPv4 (0.0.0.0/1 + 128.0.0.0/1),
 # asi que el IPv6 no tiene ruta al tunel y Windows lo sacaria por la fisica sin
