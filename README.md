@@ -241,7 +241,9 @@ cifrado, **incluso navegando internet**.
 |---|---|---|
 | VM crashea/cuelga en el 1er arranque | Transitorio de virtualización | **Máquina → Reiniciar**; arranca a la 2ª |
 | `OSError: [Errno 5]` al escribir en el TUN (VM) | El TUN se recreó al reiniciar el servidor, sin IP/up | Re-correr `sudo bash setup_vm.sh` |
-| Tormenta de `replay descartado`, ping no vuelve | Dos `vpn_client.py` corriendo (contadores colisionan) o `Peer` saltando | Dejar **un solo** cliente; reiniciar servidor y cliente **juntos** |
+| Tormenta de `replay descartado`, ping no vuelve | Dos `vpn_client.py` corriendo (contadores colisionan), o reiniciaste un solo lado | Dejar **un solo** cliente; reiniciar servidor y cliente **juntos** (ver nota de reinicios) |
+| `paquete alterado/ajeno descartado` suelto en el servidor | UDP ajeno al 51820: escaneo, basura de red, un cliente viejo | **Normal.** Se descarta y el túnel sigue. Solo importa si es constante *y* el ping no vuelve |
+| Con la VPN arriba, Wireshark sigue mostrando `dns` en claro | **Fuga IPv6**: el túnel es solo IPv4 y el v6 sale por la física (`Type: IPv6 (0x86dd)`) | Re-correr `setup_client.ps1` (ya desactiva IPv6 en la física). Verificar: `dns && ipv6` |
 | `CriptoVPN` con IP `169.254.x.x` (APIPA) | No se asignó la IP del túnel | `New-NetIPAddress -InterfaceAlias CriptoVPN -IPAddress 10.9.0.2 -PrefixLength 24` |
 | `ping 10.9.0.1` timeout pero `ping <IP_SERVIDOR>` OK | Túnel no llega a la VM | Verificar reenvío UDP 51820 (VBoxManage) y que el servidor+`setup_vm.sh` estén activos |
 | `WinError 10051 red no accesible` al lanzar el cliente | `<IP_SERVIDOR>` es `169.254.x.x` (sin DHCP) o mal | Usar la IP/puerta de enlace correcta (host en la misma red) |
@@ -278,11 +280,26 @@ python test_crypto.py    # roundtrip, bit-flip (Poly1305), replay, fuera de orde
 
 # Demostrar el cifrado en Wireshark
 
-**Elegir la interfaz.** El túnel cifrado viaja por el adaptador que une las
-laptops: con hotspot, NO es "Wi-Fi" sino una **"Conexión de área local\* N"**
-(el AP virtual, `192.168.137.x`). Lo **descifrado** aparece en `CriptoVPN`
-(`10.9.0.x`). Para hallar el del hotspot: lanza un ping continuo y mira cuál
-"Conexión de área local\*" dibuja actividad.
+**Elegir la interfaz — y la máquina.** Cada interfaz solo existe en un equipo:
+
+| Máquina | Interfaz | Ve |
+|---|---|---|
+| **Host** | `Conexión de área local* N` (el AP virtual del hotspot, `192.168.137.x`) | tráfico **cifrado** |
+| **Cliente** | `CriptoVPN` (`10.9.0.2`) | tráfico **descifrado** |
+| **VM** | `criptovpn` (`10.9.0.1`), con `tcpdump` | tráfico **descifrado** |
+
+El host **no tiene `CriptoVPN` y nunca lo va a tener**: lo crea Wintun al
+arrancar `vpn_client.py`, y eso pasa en el cliente. En el host solo capturas lo
+cifrado — que es lo que quieres.
+
+Con hotspot, el adaptador del túnel **NO es "Wi-Fi"** sino una "Conexión de área
+local\* N". Para hallar cuál: lanza un ping continuo y mira cuál dibuja
+actividad en la pantalla de bienvenida de Wireshark. El número cambia entre
+equipos, no lo adivines.
+
+`CriptoVPN` es efímero (muere con el proceso) y Wireshark enumera las interfaces
+**al abrirse**: si no aparece, `Capturar → Actualizar interfaces` (F5) con
+`vpn_client.py` ya corriendo.
 
 ### Contraste ping (mismo paquete, dos caras)
 Captura a la vez en el hotspot (`udp.port == 51820`) y en `CriptoVPN` (`icmp`),
@@ -291,39 +308,114 @@ haz `ping 10.9.0.1`:
 - `CriptoVPN` → `Echo request/reply` en claro entre `10.9.0.x`.
 
 ### Prueba estrella: texto plano vs cifrado con el "secreto"
-Sirve `demo/secreto.txt` por HTTP y compara sin/con túnel. Misma interfaz de
-captura (el hotspot); solo cambia la IP del `curl`.
 
-Firewall del servidor (una vez): `New-NetFirewallRule -DisplayName "HTTP demo" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow`
+Sirve `demo/secreto.txt` por HTTP y compara sin/con túnel. Capturas siempre en
+el **host**, en el adaptador del hotspot. Lo único que cambia es **a qué
+destino** apunta el `curl` — y con eso, si el tráfico entra al túnel o no.
 
-**Par 3 — SIN VPN (se lee el secreto):**
-- Servidor: `cd demo` y `python -m http.server 8000 --bind <IP_SERVIDOR>`
-  (en Modo B, sirve desde la VM: `python3 -m http.server 8000 --bind 10.0.2.15`
-  no sirve al cliente; para este par usa el servidor Windows del Modo A, o
-  sirve desde el host por su IP de hotspot).
-- Cliente: captura en el hotspot, filtro `tcp.port == 8000`, y
-  `curl http://<IP_SERVIDOR>:8000/secreto.txt`.
-- Clic derecho → **Seguir → Flujo HTTP**: se lee `CONTRASENA: unal2026` en
-  claro. Guardar `sin_vpn.pcapng`.
+Firewall del host (una vez): `New-NetFirewallRule -DisplayName "HTTP demo" -Direction Inbound -Protocol TCP -LocalPort 8000 -Action Allow`
 
-**Par 4 — CON VPN (solo ciphertext):**
-- Servidor (VM): `python3 -m http.server 8000 --bind 10.9.0.1` en `~/demo`
-  (copia `demo/` a la VM), o cualquier servicio en `10.9.0.1`.
-- Cliente: captura en el hotspot, filtro `udp.port == 51820`, y
-  `curl http://10.9.0.1:8000/secreto.txt`.
-- **Seguir → Flujo UDP**: ruido cifrado. Filtro `tcp.port == 8000` → nada.
-  Guardar `con_vpn.pcapng`.
+Copia el secreto a la VM (una vez, desde el **host**, en la carpeta del proyecto):
+```
+ssh -p 2222 <usuario>@localhost "mkdir -p ~/demo"     # scp no crea directorios
+scp -P 2222 demo/secreto.txt <usuario>@localhost:~/demo/
+```
+
+| | **SIN VPN** | **CON VPN** |
+|---|---|---|
+| **Sirve** | Host: `cd demo` + `python -m http.server 8000 --bind 192.168.137.1` | VM: `cd ~/demo` + `python3 -m http.server 8000 --bind 10.9.0.1` |
+| **Cliente pide** | `curl.exe http://192.168.137.1:8000/secreto.txt` | `curl.exe http://10.9.0.1:8000/secreto.txt` |
+| **Filtro (host)** | `tcp.port == 8000` | `udp.port == 51820` |
+| **Seguir flujo** | **HTTP** → se lee `CONTRASENA: unal2026` | **UDP** → ruido cifrado |
+| **`tcp.port == 8000`** | lleno | **cero paquetes** |
+| **Guardar** | `sin_vpn.pcapng` | `con_vpn.pcapng` |
+
+El destino es la variable: `192.168.137.1` es el host, en la subred del cliente
+→ nunca entra al túnel. `10.9.0.1` es la VM, al otro lado → solo se llega
+cifrado.
 
 **Golpe de gracia:** en cada captura, **Edición → Buscar paquete** → modo
 *Cadena*, ámbito "Bytes del paquete" → `CONTRASENA`.
 - `sin_vpn.pcapng`: **la encuentra** (viaja en claro).
 - `con_vpn.pcapng`: **no la encuentra** (cifrada).
 
+Verifica que el `curl` devuelve el contenido antes de creerle a Wireshark: un
+404 (ruta mal, `/demo/secreto.txt` en vez de `/secreto.txt` si hiciste
+`cd ~/demo`) también da una captura sin el secreto, y parece un éxito.
+
+### Prueba de 4 protocolos (SIN vs CON VPN)
+
+La más completa. Captura siempre en el **host**, en el adaptador del hotspot:
+ahí el host no simula un espía, **es** uno — el UDP del cliente le entra por el
+hotspot y VirtualBox lo reenvía a la VM. Sniffer legítimo en mitad del túnel.
+
+Genera los cuatro desde el cliente:
+
+| Protocolo | Comando (cliente) | Filtro (host) | SIN VPN se ve |
+|---|---|---|---|
+| **ICMP** | `ping 8.8.8.8` | `icmp` | tipo, IPs, hasta el payload |
+| **DNS** | `nslookup unal.edu.co` | `dns` | **qué sitios visitas** |
+| **HTTP** | `curl.exe http://<destino>:8000/secreto.txt` | `http` | la contraseña completa |
+| **HTTPS** | `curl.exe https://www.unal.edu.co` | `tls.handshake.extensions_server_name` | **el dominio** (SNI) |
+
+Con la VPN arriba, los cuatro filtros dan **cero paquetes**.
+
+**Un filtro para los cuatro** (`<IP_CLIENTE>` = su IP en el hotspot, típico
+`192.168.137.2`):
+```
+ip.addr == <IP_CLIENTE> && (icmp || dns || http || tls)
+```
+SIN VPN: lleno. CON VPN: vacío. Mismo filtro, misma interfaz, misma
+navegación — **cambia una sola variable**. Si cambias el filtro entre capturas,
+siempre queda la duda de si el filtro hizo el truco.
+
+Variante por ausencia, más contundente que mostrar ciphertext:
+```
+ip.addr == <IP_CLIENTE> && !(udp.port == 51820)
+```
+Todo lo del cliente que no sea el túnel. Con VPN queda casi vacío: no pruebas
+que *algo* está cifrado, pruebas que **no queda nada afuera**.
+
+**La imagen para el informe:** `Estadísticas → Jerarquía de protocolos`.
+SIN VPN el árbol entero (TCP, TLS, DNS, ICMP, HTTP); CON VPN ~100% UDP. Dos
+capturas de pantalla lado a lado, sin necesidad de saber filtrar.
+
+**El HTTPS es el que gana la defensa.** Responde a *"¿para qué VPN si hoy todo
+es HTTPS?"*: sin túnel, el contenido ya va cifrado, pero el **SNI del
+ClientHello viaja en claro** y el sniffer ve qué dominio visitas. HTTPS protege
+el *qué dices*, no el *con quién hablas*. Con el túnel, ni eso.
+
+> ⚠️ **El destino importa tanto como el túnel.** Con la VPN arriba, apuntar al
+> host (`192.168.137.1`) **no pasa por el túnel**: está en la subred del cliente
+> (la ruta conectada `/24` gana a las `/1`) y además `setup_client.ps1` le fija
+> una ruta `/32` por la física para evitar el bucle. Para la captura CON VPN el
+> destino debe estar **al otro lado**: la VM (`10.9.0.1`). Si curleas al host
+> con la VPN prendida verás el secreto en claro y parecerá que la VPN falló.
+
+> ⚠️ **Fuga de IPv6 → fuga de DNS** (medida en este proyecto, no teórica). Las
+> rutas `/1` son **IPv4**. El IPv6 no tiene ruta al túnel, así que Windows lo
+> saca por la física **sin cifrar, con la VPN arriba** — y ahí se va el DNS. En
+> Wireshark aparece como `dns` con `Type: IPv6 (0x86dd)`.
+>
+> Es la fuga clásica: **WireGuard la tiene** con `AllowedIPs = 0.0.0.0/0` sin
+> `::/0`. `setup_client.ps1` la cierra desactivando IPv6 en el adaptador físico
+> (`teardown.ps1` lo restaura). Se bloquea en vez de tunelizarlo porque la VM,
+> detrás del NAT de VirtualBox, no tiene IPv6: transportarlo cambiaría la fuga
+> por un agujero negro. Es lo que hacen los clientes VPN comerciales.
+>
+> Filtros para verla: `dns && ipv6` (la fuga) vs `dns && ip` (IPv4).
+> **Ojo:** `ip.addr` en Wireshark es **solo IPv4** y nunca matchea estos
+> paquetes — por eso una fuga v6 se pasa por alto tan fácil.
+
+> **`curl` en PowerShell no es curl** — es alias de `Invoke-WebRequest`. Usa
+> `curl.exe` para la salida cruda.
+
 > **Sobre webs reales:** con **Modo B** el internet del cliente SÍ va por el
 > túnel, así que un sniffer entre cliente y host ve solo UDP cifrado. Pero los
 > sitios reales ya usan HTTPS (TLS): sin la VPN tampoco verías el contenido,
-> solo el dominio (SNI/DNS). El contraste "texto legible → cifrado" se aprecia
-> mejor con el `http.server` local en claro.
+> solo el dominio (SNI/DNS) — que es justo lo que mide la prueba de 4
+> protocolos. El contraste "texto legible → cifrado" se aprecia mejor con el
+> `http.server` local en claro.
 
 ---
 
@@ -339,12 +431,12 @@ omiten:
 | **Forward secrecy** | No (clave estática) | Sí: claves de sesión que rotan |
 | **Autenticación de extremos** | Ninguna: quien tiene la clave entra | Claves públicas/certificados por peer |
 | **Rekeying** | Nunca (límite: contador de 64 bits) | Renegocia claves por tiempo/volumen |
-| **Handshake / sesión** | No hay; aprende la IP del 1er paquete | Handshake con anti-DoS (cookies) |
+| **Handshake / sesión** | No hay; aprende la IP del 1er paquete **autenticado** | Handshake con anti-DoS (cookies) |
 | **Multi-cliente** | Uno a la vez (contador/ventana únicos) | Muchos peers, claves por peer |
 | **Salida a internet** | Sí, vía VM Linux con NAT (Modo B) | NAT/routing nativo, split-tunnel, DNS push |
 | **Keepalive / reconexión** | Keepalive básico | Detección de peer muerto, roaming |
 | **PMTU** | MTU manual (~1400) | Descubrimiento de MTU |
-| **IPv6** | Solo IPv4 | IPv4 + IPv6 |
+| **IPv6** | Solo IPv4; el cliente lo **bloquea** para que no se fugue sin cifrar | IPv4 + IPv6 tunelizados |
 | **Rendimiento** | Python en espacio de usuario | Kernel/driver, cifrado por hardware |
 | **Multiplataforma** | Windows (Wintun) + Linux (VM) | Windows, Linux, macOS, móviles |
 

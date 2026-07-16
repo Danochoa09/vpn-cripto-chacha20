@@ -64,5 +64,21 @@ Write-Host "Tráfico de internet redirigido por el túnel (gateway $Gateway)."
 Set-DnsClientServerAddress -InterfaceAlias $TunAlias -ServerAddresses $Dns
 Write-Host "DNS del túnel: $Dns"
 
+# Cerrar la fuga IPv6. Las rutas de arriba son IPv4 (0.0.0.0/1 + 128.0.0.0/1),
+# asi que el IPv6 no tiene ruta al tunel y Windows lo sacaria por la fisica sin
+# cifrar: el DNS se fuga en claro aunque la VPN este arriba (verificado en
+# Wireshark: EtherType 0x86dd con el tunel activo). Es la fuga clasica; la misma
+# que tiene WireGuard con AllowedIPs=0.0.0.0/0 sin ::/0.
+#
+# Se bloquea en vez de tunelizarlo porque el nodo de salida (la VM, tras el NAT
+# de VirtualBox) no tiene IPv6: transportarlo cambiaria la fuga por un agujero
+# negro. Es lo que hacen los clientes VPN comerciales.
+# teardown.ps1 lo restaura.
+$physAlias = (Get-NetAdapter -InterfaceIndex $physIdx).Name
+Disable-NetAdapterBinding -InterfaceAlias $physAlias -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+Clear-DnsClientCache
+Write-Host "IPv6 desactivado en '$physAlias' (el túnel es solo IPv4; evita fuga)."
+
 Write-Host ""
 Write-Host "CLIENTE listo. Prueba:  ping 10.9.0.1   luego   ping 1.1.1.1   luego  nslookup google.com"
+Write-Host "Verifica que no haya fuga: en el host, filtro Wireshark  'dns'  -> vacío."
