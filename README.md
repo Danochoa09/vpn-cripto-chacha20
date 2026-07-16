@@ -16,16 +16,59 @@ Hay **dos formas de correrlo**:
   en-caja (`MSFT_NetNat` no existe; ICS no bincula Wintun; RRAS es solo
   Server). Linux lo resuelve con `iptables MASQUERADE`.
 
+## Arquitectura (Modo B)
+
+Tres máquinas. **Las flechas gruesas son el tramo cifrado**; todo lo demás va en
+claro. Fíjate en qué corre dónde: el host **no ejecuta Python** y por eso nunca
+tiene un adaptador `CriptoVPN` — solo ve pasar el UDP opaco.
+
+```mermaid
+flowchart TB
+    subgraph CLI["CLIENTE · Windows (Admin)"]
+        direction LR
+        A["app<br/>navegador"]
+        T1["TUN <b>CriptoVPN</b><br/>10.9.0.2<br/><small>tun_wintun.py</small>"]
+        P1["<b>vpn_client.py</b><br/>seal cifra<br/>open_ descifra"]
+        A -->|"IP en claro"| T1
+        T1 --> P1
+    end
+
+    subgraph HOST["HOST · no corre Python · el sniffer"]
+        direction LR
+        HS["Hotspot WiFi<br/>192.168.137.1<br/><b>Wireshark captura AQUI</b>"]
+        VB["VirtualBox<br/>reenvio UDP 51820"]
+        HS --> VB
+    end
+
+    subgraph VM["VM Linux · root"]
+        direction LR
+        P2["<b>vpn_server_linux.py</b><br/>open_ descifra<br/>seal cifra"]
+        T2["TUN <b>criptovpn</b><br/>10.9.0.1<br/><small>tun_linux.py</small>"]
+        NAT["kernel<br/>ip_forward<br/>iptables MASQUERADE"]
+        P2 --> T2
+        T2 --> NAT
+    end
+
+    NET(("Internet"))
+
+    P1 ==>|"UDP 51820 · 8B contador + ciphertext + tag"| HS
+    VB ==> P2
+    NAT -->|"sale con la IP publica del host"| NET
+
+    %% 5 y 6 son los dos tramos cifrados (P1==>HS y VB==>P2), contados en orden
+    %% de definicion desde 0. Si se agregan flechas antes, reajustar.
+    linkStyle 5,6 stroke:#c0392b,stroke-width:4px
+    classDef claro fill:#eef4fb,stroke:#5b8db8,color:#1b2b3a
+    classDef cifra fill:#fdecea,stroke:#c0392b,color:#3a1b1b
+    classDef neutro fill:#f4f4f4,stroke:#888,color:#222
+    class A,T1,T2,NAT claro
+    class P1,P2 cifra
+    class HS,VB,NET neutro
 ```
-MODO B (internet):
-[Cliente Win] app -> TUN(10.9.0.2) -> cifra -> UDP:51820 -> [Host laptop]
-                                                                  |  (VirtualBox reenvía :51820)
-                                                                  v
-                                                        [VM Linux] descifra -> TUN(10.9.0.1)
-                                                                  |  iptables MASQUERADE
-                                                                  v
-                                                              Internet
-```
+
+`tunnel_crypto.py` es **el mismo archivo en los dos extremos** — solo cambia el
+`role`, que decide qué clave cifra y cuál descifra. El host es un sniffer con
+acceso legítimo al cable y aun así no ve nada: nunca tiene la clave.
 
 Subred del túnel: **`10.9.0.0/24`** — servidor `10.9.0.1`, cliente `10.9.0.2`.
 Se elige `10.9.0.x` para no chocar con la WiFi/hotspot (ej. el Mobile Hotspot
@@ -286,6 +329,33 @@ Cada paquete se cifra, se autentica y lleva número de secuencia:
   datagrama repetido o muy viejo se rechaza (`ReplayError`). La verificación
   va **después** de autenticar, para que nadie envenene la ventana con
   contadores falsos.
+
+## Por qué DOS claves y no una
+
+Es la decisión menos obvia del diseño, y la que evita un desastre:
+
+```mermaid
+flowchart TB
+    K["KEY compartida · 32 B<br/>(fija en el fuente)"]
+    K --> H1["HKDF-SHA256<br/>info = 'cripto-vpn cliente-&gt;servidor'"]
+    K --> H2["HKDF-SHA256<br/>info = 'cripto-vpn servidor-&gt;cliente'"]
+    H1 --> KC["_KEY_C2S"]
+    H2 --> KS["_KEY_S2C"]
+    KC --> CS["CLIENTE: seal<br/>contador 0,1,2..."]
+    KC --> SO["SERVIDOR: open_"]
+    KS --> SS["SERVIDOR: seal<br/>contador 0,1,2..."]
+    KS --> CO["CLIENTE: open_"]
+```
+
+**El problema que resuelve:** los dos extremos arrancan su contador en 0, y el
+nonce se deriva del contador. Con una sola clave, el primer paquete del cliente
+y el primer paquete del servidor usarían **el mismo (clave, nonce)** — reuso de
+nonce, el fallo catastrófico de todo cifrado de flujo: XOR de los dos
+ciphertexts y el keystream desaparece.
+
+Con una clave por dirección, cada par `(clave, contador)` es único aunque ambos
+cuenten desde 0. Es lo mismo que hace WireGuard, y `test_crypto.py` lo verifica:
+mismo plaintext y mismo contador desde los dos lados → ciphertexts distintos.
 
 Demo:
 ```
