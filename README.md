@@ -44,9 +44,10 @@ de Windows usa `192.168.137.x`).
 | `vpn_server.py` | Servidor **Windows** (Modo A): TUN + UDP |
 | `vpn_server_linux.py` | Servidor **Linux** (Modo B, en la VM): TUN + UDP |
 | `setup_vm.sh` | (VM) IP del TUN `10.9.0.1` + `ip_forward` + `iptables MASQUERADE` |
-| `setup_client.ps1` | (Cliente) IP del TUN + rutas para mandar TODO el internet por el túnel + DNS |
+| `setup_client.ps1` | (Cliente) IP del TUN + rutas para mandar TODO el internet por el túnel + DNS + **anti-fugas**: bloquea IPv6 y pone un kill switch de DNS |
+| `teardown.ps1` | (Cliente) **Obligatorio al terminar**: retira el kill switch y restaura IPv6. Sin él, el equipo se queda sin DNS |
 | `setup_server_nonat.ps1` / `setup_client_nonat.ps1` | Modo A: un comando por lado (túnel sin internet) |
-| `setup_server.ps1` / `teardown.ps1` | Intento de NAT/ICS en Windows (no funciona en Home) y limpieza — referencia |
+| `setup_server.ps1` | Intento de NAT/ICS en Windows (no funciona en Home) — referencia |
 | `get_wintun.ps1` | Descarga `wintun.dll` |
 | `test_crypto.py` | Pruebas: roundtrip, integridad, replay, fuera de orden |
 | `demo/secreto.txt` | "Secreto" (contraseña/tarjeta/token falsos) para la prueba de Wireshark |
@@ -214,9 +215,22 @@ Luego abre una web. Con esto, un sniffer entre cliente y host solo ve UDP
 cifrado, **incluso navegando internet**.
 
 ## Cerrar (Modo B)
-- Cliente: Ctrl+C `vpn_client.py`; `setup_client.ps1` deja rutas — para
-  revertir, `teardown.ps1` o reinicia el cliente.
-- VM: Ctrl+C el servidor. El TUN desaparece.
+
+> ⚠️ **`teardown.ps1` es OBLIGATORIO en el cliente. Reiniciar no basta.**
+> `setup_client.ps1` deja dos cosas **persistentes**, que sobreviven al reboot:
+> el kill switch de DNS (regla de firewall) e IPv6 desactivado en la física.
+> Si solo haces Ctrl+C, **el equipo se queda sin resolver DNS** — no es un bug,
+> es el kill switch haciendo su trabajo con el túnel muerto.
+
+- **Cliente:** Ctrl+C `vpn_client.py`, y **después**:
+  ```
+  powershell -ExecutionPolicy Bypass -File teardown.ps1
+  ```
+  Debe imprimir `Kill switch DNS retirado` e `IPv6 restaurado en ...`. Si alguno
+  falla, avisa con el comando manual — hazlo, o te quedas sin DNS.
+- **VM:** Ctrl+C el servidor. El TUN desaparece.
+- Las rutas `/1` y la IP del túnel se van solas: cuelgan del adaptador
+  `CriptoVPN`, que Wintun borra al morir el proceso.
 
 ---
 
@@ -243,7 +257,9 @@ cifrado, **incluso navegando internet**.
 | `OSError: [Errno 5]` al escribir en el TUN (VM) | El TUN se recreó al reiniciar el servidor, sin IP/up | Re-correr `sudo bash setup_vm.sh` |
 | Tormenta de `replay descartado`, ping no vuelve | Dos `vpn_client.py` corriendo (contadores colisionan), o reiniciaste un solo lado | Dejar **un solo** cliente; reiniciar servidor y cliente **juntos** (ver nota de reinicios) |
 | `paquete alterado/ajeno descartado` suelto en el servidor | UDP ajeno al 51820: escaneo, basura de red, un cliente viejo | **Normal.** Se descarta y el túnel sigue. Solo importa si es constante *y* el ping no vuelve |
-| Con la VPN arriba, Wireshark sigue mostrando `dns` en claro | **Fuga IPv6**: el túnel es solo IPv4 y el v6 sale por la física (`Type: IPv6 (0x86dd)`) | Re-correr `setup_client.ps1` (ya desactiva IPv6 en la física). Verificar: `dns && ipv6` |
+| Con la VPN arriba, Wireshark sigue mostrando `dns` en claro | Fuga IPv6 (`Type: IPv6 (0x86dd)`) o fuga v4 del resolver | Re-correr `setup_client.ps1`: bloquea IPv6 y pone el kill switch de 53. Ver "Las tres fugas" |
+| **El cliente no resuelve nada** (web ni `nslookup`), pero `ping 8.8.8.8` sí anda | El **kill switch de DNS** sigue puesto con el túnel muerto. Falla cerrado a propósito. La regla es persistente: sobrevive al reboot | `powershell -ExecutionPolicy Bypass -File teardown.ps1` en el cliente |
+| Tras la demo, el cliente quedó sin DNS o sin IPv6 | No se corrió `teardown.ps1`; ambos cambios son persistentes | `teardown.ps1`. A mano: `Get-NetFirewallRule -DisplayName "CriptoVPN kill switch DNS" \| Remove-NetFirewallRule` y `Enable-NetAdapterBinding -Name "Wi-Fi" -ComponentID ms_tcpip6` |
 | `CriptoVPN` con IP `169.254.x.x` (APIPA) | No se asignó la IP del túnel | `New-NetIPAddress -InterfaceAlias CriptoVPN -IPAddress 10.9.0.2 -PrefixLength 24` |
 | `ping 10.9.0.1` timeout pero `ping <IP_SERVIDOR>` OK | Túnel no llega a la VM | Verificar reenvío UDP 51820 (VBoxManage) y que el servidor+`setup_vm.sh` estén activos |
 | `WinError 10051 red no accesible` al lanzar el cliente | `<IP_SERVIDOR>` es `169.254.x.x` (sin DHCP) o mal | Usar la IP/puerta de enlace correcta (host en la misma red) |
@@ -360,8 +376,10 @@ Genera los cuatro desde el cliente:
 
 Con la VPN arriba, los cuatro filtros dan **cero paquetes**.
 
-**Un filtro para los cuatro** (`<IP_CLIENTE>` = su IP en el hotspot, típico
-`192.168.137.2`):
+**Un filtro para los cuatro.** `<IP_CLIENTE>` = la IP del cliente **en el
+hotspot** (`ipconfig` en el cliente → IPv4 del Wi-Fi; el DHCP reparte por lo
+alto del rango, p. ej. `192.168.137.230`). **No la confundas con `10.9.0.2`**,
+que es su IP dentro del túnel:
 ```
 ip.addr == <IP_CLIENTE> && (icmp || dns || http || tls)
 ```
@@ -392,20 +410,14 @@ el *qué dices*, no el *con quién hablas*. Con el túnel, ni eso.
 > destino debe estar **al otro lado**: la VM (`10.9.0.1`). Si curleas al host
 > con la VPN prendida verás el secreto en claro y parecerá que la VPN falló.
 
-> ⚠️ **Fuga de IPv6 → fuga de DNS** (medida en este proyecto, no teórica). Las
-> rutas `/1` son **IPv4**. El IPv6 no tiene ruta al túnel, así que Windows lo
-> saca por la física **sin cifrar, con la VPN arriba** — y ahí se va el DNS. En
-> Wireshark aparece como `dns` con `Type: IPv6 (0x86dd)`.
+> ⚠️ **`setup_client.ps1` cierra tres fugas. Todas se midieron aquí, con el
+> cifrado funcionando sin un solo fallo.** Están documentadas abajo, en
+> "Las tres fugas": vale la pena entenderlas, porque son el corazón del
+> proyecto — ninguna es de criptografía.
 >
-> Es la fuga clásica: **WireGuard la tiene** con `AllowedIPs = 0.0.0.0/0` sin
-> `::/0`. `setup_client.ps1` la cierra desactivando IPv6 en el adaptador físico
-> (`teardown.ps1` lo restaura). Se bloquea en vez de tunelizarlo porque la VM,
-> detrás del NAT de VirtualBox, no tiene IPv6: transportarlo cambiaría la fuga
-> por un agujero negro. Es lo que hacen los clientes VPN comerciales.
->
-> Filtros para verla: `dns && ipv6` (la fuga) vs `dns && ip` (IPv4).
-> **Ojo:** `ip.addr` en Wireshark es **solo IPv4** y nunca matchea estos
-> paquetes — por eso una fuga v6 se pasa por alto tan fácil.
+> Filtros para verlas: `dns && ipv6` (fuga v6) vs `dns && ip` (fuga v4).
+> **Ojo:** `ip.addr` en Wireshark es **solo IPv4** y nunca matchea paquetes v6 —
+> por eso una fuga IPv6 se pasa por alto tan fácil.
 
 > **`curl` en PowerShell no es curl** — es alias de `Invoke-WebRequest`. Usa
 > `curl.exe` para la salida cruda.
@@ -416,6 +428,51 @@ el *qué dices*, no el *con quién hablas*. Con el túnel, ni eso.
 > solo el dominio (SNI/DNS) — que es justo lo que mide la prueba de 4
 > protocolos. El contraste "texto legible → cifrado" se aprecia mejor con el
 > `http.server` local en claro.
+
+---
+
+# Las tres fugas (y por qué ninguna era de cifrado)
+
+Documentar las capturas destapó tres fugas reales. En las tres, el
+ChaCha20-Poly1305 funcionaba **sin un solo fallo**. Lo que se fuga es lo que
+**nunca entra al túnel**, y eso lo decide el enrutamiento y el sistema
+operativo, no la criptografía. Es la razón de que una VPN sea mucho más que su
+AEAD.
+
+| # | Cómo se veía | Causa | Cierre |
+|---|---|---|---|
+| 1 | `curl` al host devolvía el secreto **en claro con la VPN arriba** | `192.168.137.1` está en la subred del cliente: la ruta conectada `/24` gana a las `/1` del túnel | No es un bug: el host es inalcanzable *a través* del túnel **por diseño** (evita el bucle). Para la prueba CON VPN el destino debe ser la VM (`10.9.0.1`) |
+| 2 | `dns` en claro, `Type: IPv6 (0x86dd)` | Las rutas `/1` son **IPv4**; el IPv6 no tiene ruta al túnel y sale por la física | `setup_client.ps1` desactiva IPv6 en la física. Se bloquea en vez de tunelizarlo: la VM (tras el NAT de VirtualBox) no tiene IPv6, así que transportarlo cambiaría la fuga por un agujero negro |
+| 3 | `dns` en claro por IPv4, **con las rutas `/1` sanas** | El cliente DNS de Windows ata la consulta a la interfaz y **no consulta la tabla de rutas** | Kill switch: bloquear el puerto 53 saliente en la física |
+
+## La nº3 merece su párrafo
+
+Es la más instructiva porque **refuta el razonamiento**. Con la VPN arriba y las
+rutas `/1` verificadas:
+
+```
+tracert -d -h 2 1.1.1.1   ->  primer salto 10.9.0.1   (por el túnel)
+consulta DNS a 1.1.1.1    ->  en claro por el WiFi    (fuera del túnel)
+```
+
+**Mismo destino, dos caminos a la vez.** El cliente DNS de Windows manda la
+consulta *por* la interfaz cuyo servidor está usando (*smart multi-homed name
+resolution*), con el socket bindeado, saltándose la tabla de rutas. `tracert`
+hace un lookup normal y va al túnel; el resolver no.
+
+De ahí se sigue que **cambiar el servidor DNS no arregla nada** — solo cambia a
+quién se le fuga (primero al DNS del hotspot, después a `1.1.1.1`, siempre en
+claro). Si no puedes redirigir la consulta, cortas el camino. Por eso el kill
+switch bloquea el puerto en vez de reconfigurar el resolver.
+
+Ninguna de las tres se dedujo razonando. Salieron de mirar la red.
+
+## Precedente
+
+La fuga nº2 **la tiene WireGuard**: `AllowedIPs = 0.0.0.0/0` sin `::/0` produce
+exactamente esto. Es de las fugas más documentadas que existen, y muchos
+clientes VPN comerciales la resuelven igual que aquí — desactivando IPv6 en vez
+de soportarlo.
 
 ---
 
