@@ -47,29 +47,22 @@ if (Test-Path $stateFile) {
     Write-Host "Sin registro '.ipv6_disabled': no se toca el IPv6 de ningún adaptador."
 }
 
-# Restaurar el DNS que setup_client.ps1 sobrescribió en los adaptadores físicos
-# (lo forzaba al DNS del túnel para que ninguna consulta saliera on-link sin
-# cifrar). El registro guarda la config ESTÁTICA previa; vacío significa que el
-# DNS venía por DHCP y hay que devolverlo a DHCP, no fijarlo.
-$dnsBackup = Join-Path $PSScriptRoot ".dns_backup"
-if (Test-Path $dnsBackup) {
-    foreach ($line in Get-Content $dnsBackup) {
-        if (-not $line.Trim()) { continue }
-        $parts = $line -split '\|', 2
-        $name = $parts[0]
-        # El NameServer del registro separa con coma o espacio segun la version.
-        $prev = if ($parts.Length -gt 1 -and $parts[1].Trim()) { $parts[1] -split '[,\s]+' | Where-Object { $_ } } else { $null }
-        if ($prev) {
-            Set-DnsClientServerAddress -InterfaceAlias $name -ServerAddresses $prev
-            Write-Host "DNS restaurado en '$name': $($prev -join ', ')"
-        } else {
-            Set-DnsClientServerAddress -InterfaceAlias $name -ResetServerAddresses
-            Write-Host "DNS de '$name' devuelto a DHCP."
-        }
+# Quitar el kill switch de DNS (setup_client.ps1 bloquea el puerto 53 saliente
+# en los adaptadores físicos para que el resolver de Windows no filtre consultas
+# por fuera del túnel). Sin esto el equipo se queda sin resolver DNS.
+$fwName = "CriptoVPN kill switch DNS"
+$rules = @(Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue)
+if ($rules) {
+    $rules | Remove-NetFirewallRule
+    # Verificar: el $ErrorActionPreference de arriba es SilentlyContinue, y un
+    # fallo callado aquí deja el equipo sin DNS sin decir por qué.
+    if (@(Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue)) {
+        Write-Warning "No se pudo quitar el kill switch de DNS. El equipo NO resolverá nombres. Quítalo a mano como Admin: Get-NetFirewallRule -DisplayName '$fwName' | Remove-NetFirewallRule"
+    } else {
+        Write-Host "Kill switch DNS retirado ($($rules.Count) regla(s))."
     }
-    Remove-Item $dnsBackup -Force
 } else {
-    Write-Host "Sin registro '.dns_backup': no se toca el DNS de ningún adaptador."
+    Write-Host "Sin kill switch DNS que retirar."
 }
 Clear-DnsClientCache
 

@@ -2,4 +2,3 @@ __pycache__/
 *.pyc
 *.pcapng
 .ipv6_disabled
-.dns_backup

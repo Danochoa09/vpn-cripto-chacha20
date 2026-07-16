@@ -65,35 +65,35 @@ Set-DnsClientServerAddress -InterfaceAlias $TunAlias -ServerAddresses $Dns
 Set-NetIPInterface -InterfaceAlias $TunAlias -InterfaceMetric 1 -ErrorAction SilentlyContinue
 Write-Host "DNS del túnel: $Dns"
 
-# Cerrar la fuga de DNS por IPv4. El hotspot entrega su propia IP como DNS por
-# DHCP (192.168.137.1), que esta en la MISMA subred que el cliente: la ruta
-# conectada /24 gana a las /1 del tunel, asi que esa consulta sale on-link, en
-# claro, con la VPN arriba. Verificado en Wireshark: Dst 192.168.137.1.
+# Cerrar la fuga de DNS (kill switch).
 #
-# No se pelea con el resolver de Windows (que consulta por varias interfaces a
-# la vez): se hace que TODO camino lleve al tunel. Con $Dns tambien en los
-# adaptadores fisicos, cualquier consulta va dirigida a $Dns -- y la ruta a $Dns
-# es la 0.0.0.0/1 por el tunel. El enrutamiento es global; el resolver no lo
-# esquiva. Si el tunel cae, $Dns sigue siendo alcanzable por la ruta fisica, asi
-# que no se rompe la resolucion.
+# El cliente DNS de Windows ATA la consulta a la interfaz cuyo servidor esta
+# usando (smart multi-homed name resolution): la manda POR esa interfaz, con el
+# socket bindeado, SIN pasar por la tabla de rutas. Medido en este proyecto:
+# `tracert 1.1.1.1` sale por 10.9.0.1 (el tunel), pero la consulta DNS al MISMO
+# 1.1.1.1 sale en claro por el WiFi. Mismo destino, dos caminos a la vez.
 #
-# Se guarda el DNS previo de cada adaptador en .dns_backup para que teardown.ps1
-# restaure exactamente lo que habia (estatico o DHCP), no un estado impuesto.
-$dnsBackup = Join-Path $PSScriptRoot ".dns_backup"
-$lines = @()
-foreach ($a in Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -ne $TunAlias }) {
-    # Get-DnsClientServerAddress devuelve los servidores EFECTIVOS sin decir de
-    # donde salen. El valor NameServer del registro solo contiene los ESTATICOS:
-    # vacio => el DNS venia por DHCP. Sin esta distincion, teardown restauraria
-    # como estatico un DNS que era de DHCP, cambiando la config del equipo a sus
-    # espaldas.
-    $key = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\$($a.InterfaceGuid)"
-    $static = (Get-ItemProperty -Path $key -Name NameServer -ErrorAction SilentlyContinue).NameServer
-    $lines += "$($a.Name)|$static"
-    Set-DnsClientServerAddress -InterfaceAlias $a.Name -ServerAddresses $Dns
+# Por eso cambiar el servidor DNS no sirve: solo cambia a QUIEN se le fuga. Si
+# no se puede redirigir la consulta, se corta el camino: se bloquea el puerto 53
+# saliente en los adaptadores fisicos. La consulta paralela por la fisica muere;
+# la que sale por el tunel responde. El tunel usa UDP 51820, no se afecta.
+#
+# Falla cerrado: si vpn_client.py muere, el DNS deja de resolver hasta correr
+# teardown.ps1. Es lo que hace un kill switch de VPN y es la mitad del punto:
+# preferimos quedarnos sin DNS antes que filtrarlo.
+$fwName = "CriptoVPN kill switch DNS"
+$physNames = @(Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -ne $TunAlias } |
+    Select-Object -ExpandProperty Name)
+# -InterfaceAlias es WildcardPattern[], no string: nombres como
+# "Conexion de area local* 2" llevan un * literal que se interpretaria como
+# comodin y bloquearia 53 en mas interfaces de las previstas.
+$physPatterns = @($physNames | ForEach-Object { [System.Management.Automation.WildcardPattern]::Escape($_) })
+Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue | Remove-NetFirewallRule
+foreach ($proto in @("UDP", "TCP")) {   # 53/TCP lo usan las respuestas grandes
+    New-NetFirewallRule -DisplayName $fwName -Direction Outbound -Protocol $proto `
+        -RemotePort 53 -InterfaceAlias $physPatterns -Action Block | Out-Null
 }
-$lines | Set-Content -Path $dnsBackup -Encoding utf8
-Write-Host "DNS $Dns forzado en los adaptadores físicos (cierra la fuga on-link)."
+Write-Host "Kill switch DNS: puerto 53 bloqueado en $($physNames -join ', ')."
 
 # Cerrar la fuga IPv6. Las rutas de arriba son IPv4 (0.0.0.0/1 + 128.0.0.0/1),
 # asi que el IPv6 no tiene ruta al tunel y Windows lo sacaria por la fisica sin
