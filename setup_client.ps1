@@ -73,11 +73,34 @@ Write-Host "DNS del túnel: $Dns"
 # Se bloquea en vez de tunelizarlo porque el nodo de salida (la VM, tras el NAT
 # de VirtualBox) no tiene IPv6: transportarlo cambiaria la fuga por un agujero
 # negro. Es lo que hacen los clientes VPN comerciales.
-# teardown.ps1 lo restaura.
-$physAlias = (Get-NetAdapter -InterfaceIndex $physIdx).Name
-Disable-NetAdapterBinding -InterfaceAlias $physAlias -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+#
+# En TODOS los adaptadores activos, no solo el de la ruta por defecto: basta una
+# interfaz con v6 viva para que la fuga siga abierta.
+#
+# Se registra en .ipv6_disabled cuales se tocaron, para que teardown.ps1 pueda
+# restaurar SOLO esos y no encienda IPv6 en adaptadores donde ya estaba apagado
+# a proposito.
+$stateFile = Join-Path $PSScriptRoot ".ipv6_disabled"
+$disabled = @()
+foreach ($a in Get-NetAdapter | Where-Object { $_.Status -eq "Up" -and $_.Name -ne $TunAlias }) {
+    $b = Get-NetAdapterBinding -InterfaceAlias $a.Name -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue
+    if (-not $b -or -not $b.Enabled) { continue }   # ya apagado: ni lo tocamos ni lo registramos
+    Disable-NetAdapterBinding -InterfaceAlias $a.Name -ComponentID ms_tcpip6
+    # Verificar de verdad. Sin esto el script podria anunciar "IPv6 desactivado"
+    # con la fuga abierta, que es peor que no intentarlo: te haria confiar.
+    $now = Get-NetAdapterBinding -InterfaceAlias $a.Name -ComponentID ms_tcpip6
+    if ($now.Enabled) {
+        throw "No se pudo desactivar IPv6 en '$($a.Name)'. El trafico v6 (DNS incluido) se fugaria SIN CIFRAR fuera del tunel. Aborta: no uses la VPN hasta resolverlo."
+    }
+    $disabled += $a.Name
+}
+$disabled | Set-Content -Path $stateFile -Encoding utf8
 Clear-DnsClientCache
-Write-Host "IPv6 desactivado en '$physAlias' (el túnel es solo IPv4; evita fuga)."
+if ($disabled) {
+    Write-Host "IPv6 desactivado y verificado en: $($disabled -join ', ')"
+} else {
+    Write-Host "IPv6 ya estaba desactivado en todos los adaptadores activos."
+}
 
 Write-Host ""
 Write-Host "CLIENTE listo. Prueba:  ping 10.9.0.1   luego   ping 1.1.1.1   luego  nslookup google.com"
